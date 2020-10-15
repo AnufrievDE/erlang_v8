@@ -15,44 +15,55 @@
 
 -export([start_vm/0]).
 -export([start_vm/1]).
+-export([start_vm/2]).
 -export([stop_vm/1]).
 
 -export([restart_vm/1]).
 
 -export([create_context/1]).
+-export([create_context/2]).
 -export([destroy_context/2]).
 
 -export([eval/3]).
 -export([eval/4]).
+-export([call/3]).
 -export([call/4]).
 -export([call/5]).
 
 start_vm() ->
-    start_vm([]).
+    start_vm(#{}).
 
-start_vm(Opts) ->
-    erlang_v8_vm:start_link(Opts).
+start_vm(Args) ->
+    erlang_v8_vm:start_link(Args).
 
-stop_vm(Pid) ->
-    erlang_v8_vm:stop(Pid).
+start_vm(ServerName, Args) ->
+    erlang_v8_vm:start_link(ServerName, Args).
 
-restart_vm(Pid) ->
-    erlang_v8_vm:restart(Pid).
+stop_vm(ServerRef) ->
+    erlang_v8_vm:stop(ServerRef).
+
+restart_vm(ServerRef) ->
+    erlang_v8_vm:restart(ServerRef).
 
 create_context(VM) ->
-    erlang_v8_vm:create_context(VM).
+    create_context(VM, undefined).
+create_context(VM, Name) ->
+    erlang_v8_vm:create_context(VM, Name).
 
 destroy_context(VM, Context) ->
     erlang_v8_vm:destroy_context(VM, Context).
 
-eval(Pid, Context, Source) ->
-    erlang_v8_vm:eval(Pid, Context, Source).
+eval(ServerRef, Context, Source) ->
+    erlang_v8_vm:eval(ServerRef, Context, Source).
 
-eval(Pid, Context, Source, Timeout) ->
-    erlang_v8_vm:eval(Pid, Context, Source, Timeout).
+eval(ServerRef, Context, Source, Timeout) ->
+    erlang_v8_vm:eval(ServerRef, Context, Source, Timeout).
 
-call(Pid, Context, FunctionName, Args) ->
-    erlang_v8_vm:call(Pid, Context, FunctionName, Args).
+call(Context, FunctionName, Args) ->
+    call(?MODULE, Context, FunctionName, Args).
 
-call(Pid, Context, FunctionName, Args, Timeout) ->
-    erlang_v8_vm:call(Pid, Context, FunctionName, Args, Timeout).
+call(ServerRef, Context, FunctionName, Args) ->
+    erlang_v8_vm:call(ServerRef, Context, FunctionName, Args).
+
+call(ServerRef, Context, FunctionName, Args, Timeout) ->
+    erlang_v8_vm:call(ServerRef, Context, FunctionName, Args, Timeout).

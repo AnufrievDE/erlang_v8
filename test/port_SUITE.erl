@@ -22,6 +22,8 @@
 -export([escaped_control_characters/1]).
 -export([crashed_port/1]).
 -export([undefined_function/1]).
+-export([supervisor_restart/1]).
+-export([initial_context/1]).
 
 %% Callbacks
 
@@ -43,8 +45,10 @@ all() ->
         big_input,
         dead_proc,
         escaped_control_characters,
-        crashed_port,
-        undefined_function
+        %crashed_port,
+        undefined_function,
+        supervisor_restart,
+        initial_context
     ].
 
 init_per_suite(Config) ->
@@ -182,7 +186,7 @@ errors(_Config) ->
     ok.
 
 contexts(_Config) ->
-    {ok, P} = erlang_v8:start_vm([{source, <<"var erlang_v8 = 'yes';">>}]),
+    {ok, P} = erlang_v8:start_vm(#{options => [{source, <<"var erlang_v8 = 'yes';">>}]}),
 
     {ok, Context1} = erlang_v8_vm:create_context(P),
     {ok, Context2} = erlang_v8_vm:create_context(P),
@@ -203,7 +207,7 @@ contexts(_Config) ->
     ok.
 
 init_from_source(_Config) ->
-    {ok, VM} = erlang_v8:start_vm([{source, <<"var erlang_v8 = 'yes';">>}]),
+    {ok, VM} = erlang_v8:start_vm(#{options => [{source, <<"var erlang_v8 = 'yes';">>}]}),
     {ok, Context} = erlang_v8_vm:create_context(VM),
 
     {ok, <<"yes">>} = erlang_v8:eval(VM, Context, <<"erlang_v8">>),
@@ -222,7 +226,7 @@ init_from_source(_Config) ->
 init_from_file(_Config) ->
     Directory = filename:dirname(code:which(?MODULE)),
     Path = filename:join(Directory, "js/variables.js"),
-    {ok, VM} = erlang_v8:start_vm([{file, Path}]),
+    {ok, VM} = erlang_v8:start_vm(#{options => [{file, Path}]}),
     {ok, Context} = erlang_v8_vm:create_context(VM),
 
     {ok, 3} = erlang_v8:eval(VM, Context, <<"z;">>),
@@ -254,7 +258,7 @@ multiple_vms(_Config) ->
     ok.
 
 big_input(_Config) ->
-    {ok, VM} = erlang_v8:start_vm([{max_source_size, 5000}]),
+    {ok, VM} = erlang_v8:start_vm(#{options => [{max_source_size, 5000}]}),
 
     {ok, Context} = erlang_v8_vm:create_context(VM),
 
@@ -349,7 +353,6 @@ crashed_port(_Config) ->
 
     {error, crashed} = erlang_v8_vm:destroy_context(P, Context2),
 
-
     erlang_v8:stop_vm(P),
     ok.
 
@@ -371,6 +374,33 @@ undefined_function(_Config) ->
     {ok, 0} = erlang_v8:call(VM, C1, <<"Decoder">>, [<<"">>, 1], 250),
 
     erlang_v8:stop_vm(VM),
+    ok.
+
+supervisor_restart(_Config) ->
+    VMPid1 = whereis(erlang_v8),
+    erlang_v8:stop_vm(VMPid1),
+    timer:sleep(500), %% we should wait a bit
+    VMPid2 = whereis(erlang_v8),
+    {ok, C0} = erlang_v8:create_context(VMPid2),
+    Function = <<"function Decoder(bytes, port) {return 0;}">>,
+    {ok, _} = erlang_v8:eval(VMPid2, C0, Function),
+    {ok, 0} = erlang_v8:call(VMPid2, C0, <<"Decoder">>, [<<"">>, 1], 250),
+    erlang_v8:stop_vm(VMPid2),
+    ok.
+
+initial_context(_Config) ->
+    Eval = <<"function mul(a, b, c, d) { return a * b * c * d }">>,
+    Node = #{
+        contexts => [
+          #{
+            name => test_ctx,
+            eval => Eval
+          }
+        ]
+    },
+    {ok, _VMPid} = erlang_v8:start_vm({local, test_node}, Node),
+    {ok, 1} = erlang_v8:call(test_node, test_ctx, <<"mul">>, [1,1,1,1]),
+    erlang_v8:stop_vm(test_node),
     ok.
 
 %% Helpers

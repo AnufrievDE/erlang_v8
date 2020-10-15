@@ -21,7 +21,8 @@
 %% Application callbacks
 
 start(_StartType, _StartArgs) ->
-    erlang_v8_sup:start_link().
+    Env = application:get_all_env(),
+    erlang_v8_sup:start_link(Env).
 
 stop(_State) ->
     ok.
