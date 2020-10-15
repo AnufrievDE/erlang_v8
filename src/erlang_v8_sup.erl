@@ -15,7 +15,7 @@
 
 -behaviour(supervisor).
 
--export([start_link/0]).
+-export([start_link/0, start_link/1]).
 
 %% Supervisor callbacks
 
@@ -27,10 +27,31 @@
 %% API functions
 
 start_link() ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    start_link([]).
+start_link(Env) ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, Env).
 
 %% Supervisor callbacks
 
-init([]) ->
-    {ok, {{one_for_one, 5, 10}, [
-        ]}}.
+init(Env) ->
+    Nodes = proplists:get_value(nodes, Env, []),
+
+    SupFlags = #{strategy => one_for_all,
+                 intensity => 1,
+                 period => 10},
+
+    ChildSpecs = [
+        #{
+            id => server_ref(ServerName),
+            start => {erlang_v8_vm, start_link,
+                [ServerName, maps:without([server_name], Node)]},
+            restart => permanent,
+            shutdown => 5000
+        } || #{server_name := ServerName} = Node <- Nodes
+    ],
+    {ok, {SupFlags, ChildSpecs}}.
+
+server_ref({local, LocalName}) when is_atom(LocalName) ->
+    LocalName;
+server_ref(ServerName) ->
+    ServerName.

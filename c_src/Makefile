@@ -15,7 +15,9 @@ DEPOT_DIR := $(LIB_DIR)/depot_tools
 V8_VERSION := "8.0.426.26"
 V8_DIR := $(LIB_DIR)/v8
 V8_LIB := $(V8_DIR)/out.gn/$(BUILD_ARCH).release/obj
-ERLANG_V8_VERSION := $(shell cd ..; git fetch --tags; git describe --tags --always)
+#ERLANG_V8_VERSION := $(shell cd ..; git fetch --tags; git describe --tags --always)
+#Set the previous version to download prebuild
+ERLANG_V8_VERSION := 0.5.6
 CURRENT_VERSION := $(shell cd $(V8_DIR); git fetch --tags; git describe --tags)
 
 TARGET_BIN := $(PRIV_DIR)/erlang_v8

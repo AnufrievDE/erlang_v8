@@ -17,12 +17,16 @@
 
 -export([start/0]).
 -export([start_link/1]).
+-export([start_link/2]).
+-export([start_link/3]).
+-export([start_link/4]).
 -export([stop/1]).
 
 -export([reset/1]).
 -export([restart/1]).
 
 -export([create_context/1]).
+-export([create_context/2]).
 -export([destroy_context/2]).
 -export([eval/3]).
 -export([eval/4]).
@@ -33,6 +37,7 @@
 -export([handle_call/3]).
 -export([handle_cast/2]).
 -export([handle_info/2]).
+-export([handle_continue/2]).
 -export([terminate/2]).
 -export([code_change/3]).
 
@@ -60,93 +65,130 @@
         monitor_pid
     }).
 
+%% internal table record
+-record(context, {
+    ctx :: pos_integer(),
+    name :: atom(),
+    mref :: reference()
+}).
+
 %% External API
 
-start_link(Opts) ->
-    gen_server:start_link(?MODULE, [Opts], []).
+start_link(Args) ->
+    start_link(undefined, Args).
+start_link(Name, Args) ->
+    start_link(Name, Args, []).
+start_link(Name, Args, Opts) ->
+    start_link(Name, ?MODULE, Args, Opts).
+start_link(undefined, ?MODULE, Args, Opts) ->
+    gen_server:start_link(?MODULE, Args, Opts);
+start_link(Name, ?MODULE, Args, Opts) ->
+    gen_server:start_link(Name, ?MODULE, Args, Opts).
 
 start() ->
     gen_server:start(?MODULE, [], []).
 
-create_context(Pid) ->
-    call_with_timeout(Pid, {create_context, self(), 1000}, 5000).
+create_context(ServerRef) ->
+    create_context(ServerRef, undefined).
+create_context(ServerRef, CtxName) ->
+    call_with_timeout(ServerRef, {create_context, CtxName, 1000}, 5000).
 
-eval(Pid, Context, Source) ->
-    eval(Pid, Context, Source, ?DEFAULT_TIMEOUT).
+eval(ServerRef, Ctx, Source) ->
+    eval(ServerRef, Ctx, Source, ?DEFAULT_TIMEOUT).
 
-eval(Pid, Context, Source, Timeout) ->
-    call_with_timeout(Pid, {eval, Context, Source, Timeout}, 30000).
+eval(ServerRef, Ctx, Source, Timeout) ->
+    call_with_timeout(ServerRef, {eval, Ctx, Source, Timeout}, 30000).
 
-call(Pid, Context, FunctionName, Args) ->
-    call(Pid, Context, FunctionName, Args, ?DEFAULT_TIMEOUT).
+call(ServerRef, Ctx, FuncName, Args) ->
+    call(ServerRef, Ctx, FuncName, Args, ?DEFAULT_TIMEOUT).
 
-call(Pid, Context, FunctionName, Args, Timeout) ->
-    call_with_timeout(Pid, {call, Context, FunctionName, Args, Timeout}, 30000).
+call(ServerRef, Ctx, FuncName, Args, Timeout) ->
+    call_with_timeout(ServerRef, {call, Ctx, FuncName, Args, Timeout}, 30000).
 
-destroy_context(Pid, Context) ->
-    gen_server:call(Pid, {destroy_context, Context}, infinity).
+destroy_context(ServerRef, Ctx) ->
+    gen_server:call(ServerRef, {destroy_context, Ctx}, infinity).
 
-reset(Pid) ->
-    gen_server:call(Pid, reset).
+reset(ServerRef) ->
+    gen_server:call(ServerRef, reset).
 
-restart(Pid) ->
-    gen_server:call(Pid, restart).
+restart(ServerRef) ->
+    gen_server:call(ServerRef, restart).
 
-stop(Pid) ->
-    closed = gen_server:call(Pid, stop),
+stop(ServerRef) ->
+    closed = gen_server:call(ServerRef, stop),
     ok.
 
 %% Callbacks
 
-init([Opts]) ->
+init(NodeArgsMap) ->
     rand:seed(exs64),
-    State = create_table(start_port(parse_opts(Opts))),
-    {ok, State}.
+    LegacyOpts = maps:get(options, NodeArgsMap, []),
+    State = start_port(parse_opts(LegacyOpts)),
 
-handle_call({call, Context, FunctionName, Args, Timeout}, _From,
-            #state{port = Port, max_source_size = MaxSourceSize} = State) ->
-    Instructions = jsx:encode(#{ function => FunctionName,
+    ContextInitializers = maps:get(contexts, NodeArgsMap, []),
+    %lazy_init_contexts(Contexts),
+    {ok, State#state{table = create_table()},
+        {continue, {create_init_contexts, ContextInitializers}}}.
+
+handle_call({call, Ctx, FuncName, Args, Timeout}, _From, State) ->
+    #state{table = Tab, port = Port, max_source_size = MaxSrcSize} = State,
+    Instructions = jsx:encode(#{ function => FuncName,
                                  args => Args,
                                  timeout => Timeout }),
-    handle_response(send_to_port(Port, ?OP_CALL, Context, Instructions,
-                                 MaxSourceSize), State);
+    Response =
+        send_to_port(Port, ?OP_CALL, context(Tab, Ctx), Instructions, MaxSrcSize),
+    handle_response(Response, State);
 
-handle_call({eval, Context, Source, Timeout}, _From,
-            #state{port = Port, max_source_size = MaxSourceSize} = State) ->
+handle_call({eval, Ctx, Source, Timeout}, _From, State) ->
+    #state{table = Tab, port = Port, max_source_size = MaxSrcSize} = State,
     Instructions = jsx:encode(#{ source => Source, timeout => Timeout }),
-    handle_response(send_to_port(Port, ?OP_EVAL, Context, Instructions,
-                                 MaxSourceSize), State);
+    Response = 
+        send_to_port(Port, ?OP_EVAL, context(Tab, Ctx), Instructions, MaxSrcSize),
+    handle_response(Response, State);
 
-handle_call({create_context, Pid, _Timeout}, _From, #state{port = Port, table = Table} = State) ->
-    Context = erlang:unique_integer([positive]),
+handle_call({create_context, CtxName, _Timeout}, {Pid, _Tag} = _From, State) ->
+    #state{port = Port, table = Tab} = State,
     MRef = erlang:monitor(process, Pid),
-    ets:insert(Table, {Context, MRef}),
-    case send_to_port(Port, ?OP_CREATE_CONTEXT, Context) of
-        {ok, _Response} ->
-            {reply, {ok, Context}, State};
-        {error, crashed}=Error ->
-            {reply, Error, start_port(kill_port(State))};
-        _Other ->
-            {reply, {error, invalid_context}, State}
+    case do_create_context(CtxName, MRef, Tab, Port) of
+        {ok, _Context} = OkRes ->
+            {reply, OkRes, State};
+        {error, crashed} = Error ->
+            {stop, Error, State};
+            %{reply, Error, start_port(kill_port(State))};
+        OtherError ->
+            {reply, OtherError, State}
     end;
 
-handle_call({destroy_context, Context}, _From,
-            #state{port = Port, table = Table} = State) ->
-    case ets:lookup(Table, Context) of
-        [{_Context, MRef}] ->
-            true = ets:delete(Table, Context),
-            true = erlang:demonitor(MRef, [flush]);
-        [] ->
-            ok
+handle_call({destroy_context, CtxOrCtxName}, _From,
+            #state{port = Port, table = Tab} = State) ->
+    Pattern =
+        case CtxOrCtxName of
+            C when is_atom(C) ->
+                #context{name = C, _ = '_'};
+            C when is_integer(C) ->
+                #context{ctx = C, _ = '_'}
+        end,
+    {Result, NewState} =
+    case ets:match_object(Tab, Pattern) of
+        [#context{mref = MRef, ctx = Ctx}] ->
+            true = ets:delete(Tab, Ctx),
+            case MRef of
+                undefined -> ok;
+                _ -> erlang:demonitor(MRef, [flush])
+            end,
+            case send_to_port(Port, ?OP_DESTROY_CONTEXT, Ctx) of
+                {ok, _Response} ->
+                    {ok, State};
+                {error, crashed} = Error ->
+                    {stop, Error, State};
+                    %{Error, start_port(kill_port(State))};
+                _OtherError ->
+                    {{error, invalid_context}, State}
+            end;
+        _ ->
+            {{error, invalid_context}, State}
     end,
-    case send_to_port(Port, ?OP_DESTROY_CONTEXT, Context) of
-        {ok, _Response} ->
-            {reply, ok, State};
-        {error, crashed}=Error ->
-            {reply, Error, start_port(kill_port(State))};
-        _Other ->
-            {reply, {error, invalid_context}, State}
-    end;
+    {reply, Result, NewState};
 
 handle_call(reset, _From, #state{port = Port} = State) ->
     Port ! {self(), {command, <<?OP_RESET_VM:8>>}},
@@ -165,18 +207,41 @@ handle_cast(_Message, State) ->
     {noreply, State}.
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            #state{table = Table, port = Port} = State) ->
-    [[Context]] = ets:match(Table, {'$1', MRef}),
-    true = ets:delete(Table, Context),
-    case send_to_port(Port, ?OP_DESTROY_CONTEXT, Context) of
-        {error, crashed} ->
-            {noreply, start_port(kill_port(State))};
+            #state{table = Tab, port = Port} = State) ->
+    [#context{ctx = Ctx}] = 
+        ets:match_object(Tab, #context{mref = MRef, _ = '_'}),
+    true = ets:delete(Tab, Ctx),
+    case send_to_port(Port, ?OP_DESTROY_CONTEXT, Ctx) of
+        {error, crashed} = Error ->
+            {stop, Error, State};
+            %{noreply, start_port(kill_port(State))};
         _ ->
             {noreply, State}
     end;
 
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+handle_continue({create_init_contexts, ContextInitializers}, State) ->
+    #state{table = Tab, port = Port, max_source_size = MaxSrcSize} = State,
+    Result = lists:foldl(
+        fun(#{name := CtxName, eval := Eval}, {ok, _Response}) ->
+            case do_create_context(CtxName, Tab, Port) of
+                {ok, Ctx} ->
+                    Instructions = jsx:encode(
+                        #{source => Eval, timeout => ?DEFAULT_TIMEOUT}),
+                    send_to_port(
+                        Port, ?OP_EVAL, Ctx, Instructions, MaxSrcSize);
+                Error -> Error
+            end;
+            (_, Error) -> Error
+        end, {ok, boomer}, ContextInitializers),
+    case Result of
+        {error, _Reason} = Error ->
+            {stop, {create_init_contexts, Error}, State};
+        _ ->
+            {noreply, State}
+    end.
 
 terminate(_Reason, State) ->
     close_port(State),
@@ -193,8 +258,11 @@ handle_response({error, invalid_source_size} = Error, State) ->
     {reply, Error, State};
 handle_response({call_error, Reason}, State) ->
     {reply, {error, Reason}, State};
+handle_response({error, crashed} = Error, State) ->
+    {stop, Error, State};
 handle_response({error, _Reason} = Error, State) ->
-    {reply, Error, start_port(kill_port(State))}.
+    {reply, Error, State}.
+    %{reply, Error, start_port(kill_port(State))}.
 
 %% @doc Close port gently.
 close_port(#state{monitor_pid = Pid, port = Port} = State) ->
@@ -208,9 +276,35 @@ kill_port(#state{monitor_pid = Pid, port = Port} = State) ->
     Pid ! kill,
     State#state{monitor_pid = undefined, port = undefined}.
 
-create_table(State) ->
-    TableRef = ets:new(?MODULE, [ordered_set]),
-    State#state{table = TableRef}.
+create_table() ->
+    ets:new(?MODULE,  [ordered_set, {keypos, 2}]). %named_table,
+
+do_create_context(CtxName, Tab, Port) ->
+    do_create_context(CtxName, undefined, Tab, Port).
+do_create_context(CtxName, MRef, Tab, Port)
+    when is_atom(CtxName) andalso (MRef =:= undefined orelse is_reference(MRef)) ->
+    Ctx = erlang:unique_integer([positive]),
+    case send_to_port(Port, ?OP_CREATE_CONTEXT, Ctx) of
+        {ok, _Response} ->
+            ets:insert(Tab, #context{ctx = Ctx, name = CtxName, mref = MRef}),
+            {ok, Ctx};
+        {error, crashed} = Error ->
+            Error;
+        _Other ->
+            {error, invalid_context}
+    end;
+do_create_context(_, _, _, _) ->
+    {error, invalid_input}.
+
+context(Tab, CtxName) when is_atom(CtxName) ->
+    MatchRes = ets:match_object(Tab, #context{name = CtxName, _ = '_'}),
+    case MatchRes of
+        [#context{ctx = Ctx}] -> Ctx;
+        _ ->
+            -1
+    end;
+context(_Table, Ctx) when is_integer(Ctx) ->
+    Ctx.
 
 %% @doc Start port and port monitor.
 start_port(#state{initial_source = Source} = State) ->
@@ -253,8 +347,8 @@ send_to_port(Port, Op, Ref, Data) ->
     send_to_port(Port, Op, Ref, Data, infinity).
 
 %% @doc Send source to port and wait for response
-send_to_port(_Port, _Op, _Ref, Data, MaxSourceSize)
-  when size(Data) > MaxSourceSize ->
+send_to_port(_Port, _Op, _Ref, Data, MaxSrcSize)
+  when size(Data) > MaxSrcSize ->
     {error, invalid_source_size};
 send_to_port(Port, Op, Ref, Data, _MaxSourceSize) ->
     Port ! {self(), {command, <<Op:8, Ref:32, Data/binary>>}},
